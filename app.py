@@ -13,9 +13,8 @@ from llama_index.core import Settings
 from llama_index.core.callbacks import CallbackManager
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import VectorIndexRetriever
-from mail_cues import read_mail_cues, parse_mail_cues
 
-from prompts import ASSESSMENT_PROMPT, SYSTEM_PROMPT
+from prompts import QUERY_SELECTION_PROMPT, SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -40,16 +39,19 @@ configurations = {
 }
 
 # Choose configuration
-# config_key = "openai_gpt-4"
-config_key = "mistral_7B_instruct"
+config_key = "openai_gpt-4"
+# config_key = "mistral_7B_instruct"
 # config_key = "mistral_7B"
 
 # Get selected configuration
 config = configurations[config_key]
 client = openai.AsyncClient(api_key=config["api_key"], base_url=config["endpoint_url"])
 
-
-
+gen_kwargs = {
+    "model": config["model"],
+    "temperature": 0.3,
+    "max_tokens": 500
+}
 
 langfuse_callback_handler = LlamaIndexCallbackHandler()
 Settings.callback_manager = CallbackManager([langfuse_callback_handler])
@@ -65,12 +67,16 @@ query_engine = None
 @cl.on_chat_start
 async def start():
     global query_engine
+    global calendar_documents
+    global order_update_documents
+    global newsletter_summary_documents
+    global follow_up_documents
 
     # Instantiate the CustomGmailReader
     loader = CustomGmailReader(
         query="",
-        max_results=10,
-        results_per_page=10,
+        max_results=2,
+        results_per_page=2,
         service=None
     )   
 
@@ -96,7 +102,7 @@ async def start():
     # Create retriever
     retriever = VectorIndexRetriever(index=index)
 
-    # Create query engine
+    # # Create query engine
     query_engine = RetrieverQueryEngine(retriever=retriever)
 
     await cl.Message(content="Email data loaded. You can now ask questions about your emails.").send()
@@ -110,46 +116,22 @@ def get_latest_user_message(message_history):
     return None
 
 async def assess_message(message_history):
-    print(message_history)
-
-    file_path = "mail_cues.md"
-    markdown_mail_cues = read_mail_cues(file_path)
-    parsed_mail_cues = parse_mail_cues(markdown_mail_cues)
-
     latest_message = get_latest_user_message(message_history)
+    print("\n\n-----------------Latest Message:-----------------")
+    print(latest_message)
 
     # Remove the original prompt from the message history for assessment
     filtered_history = [msg for msg in message_history if msg['role'] != 'system']
 
-    # Convert message history, actions, knowledge, and reminders to strings
-    history_str = json.dumps(filtered_history, indent=4)
-    calendar_events_str = json.dumps(parsed_mail_cues.get("calendar_events", []), indent=4)
-    order_updates_str = json.dumps(parsed_mail_cues.get("order_updates", {}), indent=4)
-    newsletter_summaries_str = json.dumps(parsed_mail_cues.get("newsletter_summaries", []), indent=4)
-    follow_ups_str = json.dumps(parsed_mail_cues.get("follow_ups", []), indent=4)
-
     # Generate the assessment prompt
-    filled_prompt = ASSESSMENT_PROMPT.format(
-        latest_message=latest_message,
-        history=history_str,
-        calendar_events=calendar_events_str,
-        order_updates=order_updates_str,
-        newsletter_summaries=newsletter_summaries_str,
-        follow_ups=follow_ups_str,
-        current_date=datetime.now().strftime("%Y-%m-%d")
-    )
-
-
-    gen_kwargs = {
-        "model": "gpt-4o",
-        "max_tokens": 1000,
-        "temperature": 0.5
-    }
-
+    filled_prompt = QUERY_SELECTION_PROMPT.format(history=filtered_history, current_date=datetime.now().strftime("%Y-%m-%d"), latest_message=latest_message)
+    print("\n\n-----------------Filled Prompt:-----------------")
     print(filled_prompt)
+
     response = await client.chat.completions.create(messages=[{"role": "system", "content": filled_prompt}], **gen_kwargs)
     assessment_output = response.choices[0].message.content.strip()
     print("Assessment Output: \n\n", assessment_output)
+    return assessment_output
 
 @cl.on_message
 async def on_message(message: cl.Message):
@@ -159,15 +141,21 @@ async def on_message(message: cl.Message):
         await cl.Message(content="Email data is not loaded yet. Please wait or restart the application.").send()
         return
 
-
+    # Add the user message to the message history
     message_history = cl.user_session.get("message_history", [])
     if not message_history or message_history[0].get("role") != "system":
         message_history.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
     message_history.append({"role": "user", "content": message.content})
-    asyncio.create_task(assess_message(message_history))
 
-    response_message = cl.Message(content="")
+    query = await assess_message(message_history)
+    print("\n\n-----------------Query:-----------------")
+    print(query)
 
-    # response = query_engine.query(message.content)
+    email_query_response = query_engine.query(query)
+    print("\n\n-----------------Email Query Response:-----------------")
+    print(email_query_response)
+    await cl.Message(content=str(email_query_response)).send()
 
-    await cl.Message(content=str(response_message)).send()
+    # Add the email query response to the message history   
+    message_history.append({"role": "assistant", "content": email_query_response})
+    cl.user_session.set("message_history", message_history)
